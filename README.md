@@ -1,6 +1,5 @@
-:blush:
-动态洋流场景下的深度强化学习（Deep Reinforcement Learning, DRL） 的自主导航系统 🌊:
 
+# 动态洋流场景下的深度强化学习（Deep Reinforcement Learning, DRL） 的自主导航系统 🌊:
 
 
 # OceanMaze: 基于 DDQN 的复杂流场动态路径规划
