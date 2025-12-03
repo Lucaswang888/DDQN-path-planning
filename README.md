@@ -13,16 +13,127 @@
 
 环境感知
 
-OceanMaze: 基于 DDQN 的复杂流场动态路径规划OceanMaze 是一个基于深度强化学习（Deep Reinforcement Learning, DRL）的自主水面无人艇（ASV）路径规划仿真系统。本项目重点模拟了在动态洋流（Lamb Vortex Field）和密集漂移障碍物环境下的能量感知导航问题。该项目是相关论文算法的复现与增强版本，采用了 Double DQN (DDQN) 结合 优先经验回放 (PER) 和 N-Step Learning，实现了智能体在复杂时变环境中的高效避障与借力导航。📖 项目简介在真实的海洋环境中，洋流和漂浮物对航行有着巨大影响。传统的静态路径规划无法有效应对环境的动态变化。本项目构建了一个包含以下特征的复杂环境：流场干扰：引入兰姆涡（Lamb Vortex）模拟非均匀洋流。动态障碍：大量随洋流实时漂移的障碍物（模拟浮冰或漂浮物）。复杂地形：包含巨型环礁、峡谷和狭窄通道。智能体通过强化学习，不仅学会了避障，还学会了**利用洋流（顺流而行）**来节省能量并快速到达终点。🚀 核心特性1. 高级 DRL 算法架构本项目并未使用基础 DQN，而是集成了多种 State-of-the-Art (SOTA) 技巧以提升收敛性和稳定性：Double DQN (DDQN): 消除 Q 值过高估计偏差，训练更稳定。Prioritized Experience Replay (PER): 基于 SumTree 实现，优先学习高误差样本（"难"的样本），大幅提升数据利用率。N-Step Learning (N=3): 能够更快地传播奖励信号，适应长序列决策任务。Curriculum Learning (课程学习): 训练难度从 0.2 随 Episode 逐渐增加至 1.0，引导智能体逐步掌握复杂环境。2. 物理与运动学模型系统并未采用简单的网格移动，而是基于连续空间的运动学合成：速度矢量合成: 机器人的实际位移 $\vec{P}_{new} = (\vec{V}_{propulsion} + \vec{V}_{current}) \cdot \Delta t$。流场感知: 智能体能够感知当前坐标下的流速矢量 $(u, v)$。能量模型: 模拟真实物理耗能 $E \propto c \cdot v^3 \cdot t$。由于推进速度恒定，智能体通过最小化时间步数来隐式地优化能量（即学会寻找顺流路径，避免逆流）。3. 混合状态感知 (Sensor)智能体通过 12 维向量感知世界：[0-7] 模拟雷达: 8 个方向的射线探测，获取障碍物距离。[8-9] 目标导向: 归一化距离 + 相对角度。[10-11] 自身感知: 当前位置的洋流速度分量 $(u, v)$。🛠️ 安装与依赖本项目基于 Python 3 开发，依赖以下库：Bashpip install numpy torch matplotlib
-注意：本项目包含两个主要文件 main.py 和 flow_dynamics.py（需确保物理模块存在）。💻 使用说明项目的所有配置均位于 main.py 顶部的配置区域。1. 训练模式 (Training)将配置修改为训练模式：Python# main.py
+这是一个格式完整的 `README.md` 文件内容。您可以直接点击代码框右上角的“复制”按钮，然后将其粘贴并保存为名为 `README.md` 的文件中。
+
+
+# OceanMaze: 基于 DDQN 的复杂流场动态路径规划
+
+**OceanMaze** 是一个基于深度强化学习（Deep Reinforcement Learning, DRL）的自主水面无人艇（ASV）路径规划仿真系统。本项目重点模拟了在**动态洋流（Lamb Vortex Field）**和**密集漂移障碍物**环境下的能量感知导航问题。
+
+该项目是相关论文算法的复现与增强版本，采用了 **Double DQN (DDQN)** 结合 **优先经验回放 (PER)** 和 **N-Step Learning**，实现了智能体在复杂时变环境中的高效避障与借力导航。
+
+---
+
+## 📖 项目背景
+
+在真实的海洋环境中，洋流和漂浮物对航行有着巨大影响。传统的静态路径规划无法有效应对环境的动态变化。本项目构建了一个包含以下特征的复杂环境：
+
+* **流场干扰**：引入兰姆涡（Lamb Vortex）模拟非均匀洋流场。
+* **动态障碍**：模拟大量随洋流实时漂移的浮冰或漂浮物（`drift: True`）。
+* **复杂地形**：包含巨型环礁、峡谷和狭窄通道等非凸地形。
+
+智能体通过强化学习，不仅学会了避障，还学会了**利用洋流（顺流而行）**来节省能量并快速到达终点。
+
+## 🚀 核心特性
+
+### 1. 高级 DRL 算法架构
+本项目集成了多种 State-of-the-Art (SOTA) 技巧以提升训练效率：
+* **Double DQN (DDQN)**: 分离选择网络与评估网络，消除 Q 值过高估计偏差。
+* **Prioritized Experience Replay (PER)**: 基于 `SumTree` 实现，优先回放 TD-error 大的样本，大幅提升数据利用率。
+* **N-Step Learning (N=3)**: 利用多步回报，加快奖励信号传播，适应长序列决策。
+* **Curriculum Learning (课程学习)**: 训练难度系数 `difficulty` 从 0.2 随 Episode 逐渐增加至 1.0，引导智能体从简单环境过渡到复杂环境。
+
+### 2. 物理与运动学模型 (Kinematics & Energy)
+系统并未采用简单的网格移动，而是基于连续空间的运动学合成：
+* **速度矢量合成**: 机器人的实际位移由推进速度与环境流速合成：
+    $$\vec{P}_{new} = (\vec{V}_{prop} + \vec{V}_{current}) \cdot \Delta t$$
+* **流场感知**: 智能体能够感知当前坐标下的流速矢量 $(u, v)$。
+* **能量隐喻**: 模拟物理耗能 $E \propto c \cdot v^3 \cdot t$。由于推进功率恒定，智能体通过学习最小化**时间步数**，从而隐式地学会寻找顺流路径（利用流场加速）并避开逆流区域。
+
+### 3. 混合状态感知 (Sensor)
+智能体通过 12 维向量感知世界：
+* **[0-7] 模拟雷达**: 8 个方向的射线探测，获取静态/动态障碍物距离。
+* **[8-9] 目标导向**: 归一化目标距离 + 相对角度。
+* **[10-11] 自身感知**: 当前位置的洋流速度分量 $(u, v)$。
+
+## 🛠️ 环境依赖
+
+本项目基于 Python 3 开发。请确保安装以下依赖库：
+
+```bash
+pip install numpy torch matplotlib
+````
+
+*注意：本项目依赖外部物理模块 `flow_dynamics.py`（需包含 `LambVortexField` 类和 `kinematic_update` 函数）。*
+
+## 💻 使用说明
+
+所有配置项均位于 `main.py` 顶部的配置区域。
+
+### 1\. 训练模式 (Training)
+
+将配置修改为训练模式：
+
+```python
+# main.py
 IS_TRAINING = True  # 开启训练
-运行脚本：Bashpython main.py
-输出: 训练过程中会实时打印 Episode 奖励、步数及难度系数。保存: 模型会自动保存至 checkpoints/ddqn_final_state.pth。可视化: 训练中每当打破最佳记录时，会生成静态轨迹图 train_best_ep{EP}.png。2. 测试与可视化模式 (Testing)加载训练好的模型并生成 GIF 动图：Python# main.py
+```
+
+运行脚本：
+
+```bash
+python main.py
+```
+
+  * **过程**: 控制台会实时打印 Episode 奖励、步数及当前难度系数。
+  * **保存**: 模型会自动保存至 `checkpoints/ddqn_final_state.pth`。
+  * **可视化**: 每当打破最佳分数记录时，会自动保存静态轨迹图 `train_best_ep{EP}.png`。
+
+### 2\. 测试与可视化模式 (Testing)
+
+加载训练好的模型并生成 GIF 动图：
+
+```python
+# main.py
 IS_TRAINING = False # 关闭训练，进入测试模式
-运行脚本：Bashpython main.py
-功能: 智能体将尝试 10 次导航任务。输出: 仅当导航成功 (Success) 时，程序会自动录制并生成 GIF 动图保存至 test_results_gif/ 文件夹。效果: 你将看到机器人在密集的绿色漂浮雷区中穿梭，并巧妙利用蓝色流场箭头指示的洋流。📂 文件结构Plaintext.
+```
+
+运行脚本：
+
+```bash
+python main.py
+```
+
+  * **过程**: 智能体将尝试 10 次高难度导航任务。
+  * **输出**: 仅当导航**成功 (Success)** 时，程序会自动录制并生成 GIF 动图保存至 `test_results_gif/` 文件夹。
+  * **效果**: 您将看到机器人在密集的绿色漂浮雷区中穿梭，并利用蓝色箭头指示的洋流进行导航。
+
+## 📂 文件结构
+
+```text
+.
 ├── main.py              # 主程序：包含 DRL 算法、环境类、训练/测试循环
-├── flow_dynamics.py     # (需自行确保) 物理流场模块，提供 LambVortexField
-├── checkpoints/         # 存放训练好的模型权重 (.pth)
-└── test_results_gif/    # 存放测试生成的 GIF 结果
-📊 关键参数配置你可以在 main.py 中调整以下超参数：参数名默认值描述PROPULSION_SPEED5.0机器人恒定推进速度TIME_STEP0.5物理仿真步长 (dt)BATCH_SIZE128经验回放 Batch 大小LR1e-4学习率MEMORY_CAPACITY50000经验池容量IS_TRAININGTrue/False模式切换开关🤝 致谢本项目参考了 ASV 路径规划领域的相关文献，特别是关于能量感知（Energy-Aware）导航和流场利用的研究。代码实现了一个完整的“论文复现级”仿真环境。
+├── flow_dynamics.py     # 物理流场模块 (需确保存在)
+├── checkpoints/         # 自动创建：存放训练好的模型权重 (.pth)
+└── test_results_gif/    # 自动创建：存放测试生成的 GIF 结果
+```
+
+## 📊 关键参数配置
+
+您可以在 `main.py` 中调整以下超参数以改变训练行为：
+
+| 参数名 | 默认值 | 描述 |
+| :--- | :--- | :--- |
+| `PROPULSION_SPEED` | 5.0 | 机器人恒定推进速度 |
+| `TIME_STEP` | 0.5 | 物理仿真步长 (dt) |
+| `BATCH_SIZE` | 128 | 经验回放 Batch 大小 |
+| `LR` | 1e-4 | 学习率 |
+| `MEMORY_CAPACITY` | 50000 | PER 经验池容量 |
+| `EPISODES` | 3000 | 总训练轮数 |
+
+## 🤝 致谢
+
+本项目参考了 ASV 路径规划领域的相关文献，特别是关于能量感知（Energy-Aware）导航和流场利用的研究。代码实现了一个完整的“论文复现级”仿真环境。
+
+```
+```
