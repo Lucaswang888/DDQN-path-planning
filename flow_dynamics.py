@@ -2,69 +2,89 @@
 """
 flow_dynamics.py
 ----------------
-一个简单的二维力学积分模块：
-
-给定：
-- 加速度向量场 a(x, t)，这是“力场 / 加速度场”
-- 粒子当前位置 x(t) 和当前速度 v(t)
-- 时间步长 dt
-
-返回：
-- 下一时刻的位置 x(t + dt)
-- 下一时刻的速度 v(t + dt)
-
-默认使用半隐式欧拉（symplectic Euler）积分：
-    v_{t+dt} = v_t + a(x_t, t) * dt
-    x_{t+dt} = x_t + v_{t+dt} * dt
+包含论文 "Adaptive Energy-Aware Navigation..." 中的核心物理模型：
+1. Lamb-Oseen 涡旋流场模型 (Eq. 2.1)
+2. 运动学合成模型 (Eq. 3.6)
 """
 
-from __future__ import annotations
-
-from typing import Callable, Tuple
 import numpy as np
-
-# 加速度场类型：接受位置和时间，返回加速度向量
-AccelerationField = Callable[[np.ndarray, float], np.ndarray]
+import math
 
 
-def integrate_step(
-    acc_field: AccelerationField,
-    position: np.ndarray,
-    velocity: np.ndarray,
-    t: float,
-    dt: float,
-) -> Tuple[np.ndarray, np.ndarray]:
+class LambVortexField:
     """
-    对单个粒子做一步时间积分。
-
-    参数
-    ----
-    acc_field : callable
-        加速度向量场函数 a(x, t)，返回形如 [ax, ay] 的 numpy 数组。
-    position : np.ndarray
-        当前粒子位置向量 x(t)，形状应为 (2,) 或 (n_dim,)。
-    velocity : np.ndarray
-        当前粒子速度向量 v(t)，形状与 position 相同。
-    t : float
-        当前时间 t（秒）。
-    dt : float
-        时间步长 Δt（秒），即“时间精度”。
-
-    返回
-    ----
-    next_position : np.ndarray
-        下一时刻位置 x(t + dt)。
-    next_velocity : np.ndarray
-        下一时刻速度 v(t + dt)。
+    基于论文 Eq (2.1) 实现的 Lamb 涡旋流场
     """
-    pos = np.asarray(position, dtype=float)
-    vel = np.asarray(velocity, dtype=float)
 
-    # 计算当前时刻的加速度 a(x(t), t)
-    acc = np.asarray(acc_field(pos, t), dtype=float)
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+        self.vortices = []
+        self.uniform_flow = np.array([0.0, 0.0])  # 可选背景流
+        self._init_paper_vortices()
 
-    # 半隐式欧拉：先更新速度，再用新速度更新位置
-    next_velocity = vel + acc * dt
-    next_position = pos + next_velocity * dt
+    def _init_paper_vortices(self):
+        """
+        大幅降低 D 值，确保最大流速在机器人可控范围内 (例如 2.0 m/s 左右)
+        """
+        self.vortices = [
+            # 原来是 50000 -> 改为 3000
+            # 原来是 60000 -> 改为 4000
+            {'x': 300, 'y': 500, 'D': 3000, 'R': 150, 'vx': 0.1, 'vy': 0.05},
+            {'x': 700, 'y': 500, 'D': -4000, 'R': 150, 'vx': -0.1, 'vy': -0.05},
+            {'x': 500, 'y': 200, 'D': 2000, 'R': 120, 'vx': 0.0, 'vy': 0.1},
+            {'x': 500, 'y': 800, 'D': -2000, 'R': 120, 'vx': 0.0, 'vy': -0.1},
+            {'x': 500, 'y': 500, 'D': 1500, 'R': 80, 'vx': 0.0, 'vy': 0.0}
+        ]
 
-    return next_position, next_velocity
+    def get_velocity(self, x, y, t=0.0):
+        """
+        根据论文 Eq (2.1) 计算位置 (x,y) 在时间 t 的洋流速度 Vo
+        """
+        v_total = self.uniform_flow.copy()
+
+        for v in self.vortices:
+            # 涡旋中心随时间漂移
+            cx = v['x'] + v['vx'] * t
+            cy = v['y'] + v['vy'] * t
+
+            dx = x - cx
+            dy = y - cy
+            r2 = dx ** 2 + dy ** 2 + 1e-6  # 避免除零
+
+            # --- 论文 Eq (2.1) 核心公式 ---
+            # 系数部分: D / (2 * pi * r^2) * (1 - exp(-r^2/R^2))
+            # 这里的 r^2 在分母，论文公式是 ||c-c0||^2
+            factor = (v['D'] / (2 * np.pi * r2)) * (1 - np.exp(-r2 / (v['R'] ** 2)))
+
+            # 线速度转化为分量：
+            # vx = -dy * factor
+            # vy =  dx * factor
+            v_total[0] += -dy * factor
+            v_total[1] += dx * factor
+
+        return v_total
+
+
+def kinematic_update(pos, propulsion_vec, flow_vec, dt):
+    """
+    基于论文 Eq (3.6) 的运动学更新
+    Vs (对地速度) = Va (推进速度) + Vo (洋流速度)
+
+    参数:
+    - pos: 当前位置 [x, y]
+    - propulsion_vec: 机器人推进矢量 Va [vx, vy]
+    - flow_vec: 洋流矢量 Vo [vx, vy]
+    - dt: 时间步长
+
+    返回:
+    - new_pos: 新位置
+    - ground_vel: 对地速度 Vs
+    """
+    # 向量合成
+    ground_vel = propulsion_vec + flow_vec
+
+    # 位置更新: P_new = P_old + Vs * dt
+    new_pos = pos + ground_vel * dt
+
+    return new_pos, ground_vel

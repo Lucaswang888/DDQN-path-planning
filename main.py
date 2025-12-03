@@ -1,55 +1,65 @@
 # -*- coding: utf-8 -*-
 # main.py
-# 固定起点终点与洋流地图的单任务训练/测试脚本
+# 论文复现版 (巨型障碍物 + 密集漂移雷区 + GIF可视化)
 
-import copy
+import os
 import sys
+import math
 import time
-import datetime
 import random
+import datetime
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 import collections
-import math
-import os
+from matplotlib.animation import FuncAnimation
 
-# 引入你的动力学模块
-from flow_dynamics import integrate_step
+# === 引入物理模块 ===
+from flow_dynamics import LambVortexField, kinematic_update
 
 # ================= 配置区域 =================
-# 【核心开关】 True = 训练模式; False = 测试模式 (加载模型并演示)
-IS_TRAINING = True 
+IS_TRAINING = False  # True: 训练模式; False: 测试模式(生成GIF)
 
-# 模型保存路径
-MODEL_PATH = "checkpoints/ddqn_fixed_task.pth"
+MODEL_PATH = os.path.join("checkpoints", "ddqn_final_state.pth")
 
-# 固定任务配置
-START_POS = [100, 100]  # 起点
-GOAL_POS  = [900, 900]  # 终点
-# ===========================================
+# 物理参数
+PROPULSION_SPEED = 5.0
+DRAG_C = 0.5
+TIME_STEP = 0.5
+
+# 训练参数
+BATCH_SIZE = 128
+GAMMA = 0.99
+LR = 1e-4
+MAX_STEPS = 2000
+EPISODES = 3000
+N_STEP = 3
+
+# PER 参数
+MEMORY_CAPACITY = 50000
+PER_ALPHA = 0.6
+PER_BETA = 0.4
+PER_BETA_INC = 0.0005
+ABS_ERROR_UPPER = 1.0
+
+# === 奖励权重 ===
+PROGRESS_WEIGHT = 2.0
+DIR_WEIGHT = 1.5
+TIME_PENALTY = 0.02
+GOAL_REWARD = 1000.0
+COLLISION_REWARD = -50.0
+
+LAMBDA_SCORE = 0.0005
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-USE_DDQN = True
 
-# 奖励参数 (针对固定任务微调)
-PROGRESS_WEIGHT = 2.0      # 加大进度奖励，鼓励快速靠近
-ENERGY_WEIGHT   = 0.0005
-TIME_PENALTY    = 0.05     # 加大时间惩罚，逼迫它走更短路径
-GOAL_REWARD     = 1000.0   # 终点大奖
-COLLISION_REWARD = -10.0   # 稍微给点碰撞惩罚，让它长记性
 
-# 绘图设置
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
-plt.rcParams['axes.unicode_minus'] = False
-
+# ================= 日志工具 =================
 class Prog:
-    COLORS = dict(
-        INIT="\033[95m", LEARN="\033[94m", EVAL="\033[96m",
-        BEST="\033[92m", WARN="\033[93m", STOP="\033[91m", END="\033[0m"
-    )
+    COLORS = dict(INIT="\033[95m", LEARN="\033[94m", TEST="\033[96m", BEST="\033[92m", END="\033[0m")
+
     @staticmethod
     def log(kind, msg):
         c = Prog.COLORS.get(kind, "")
@@ -57,254 +67,419 @@ class Prog:
         print(f"{datetime.datetime.now().strftime('%H:%M:%S')} {c}[{kind}]{e} {msg}")
         sys.stdout.flush()
 
-def calculate_path_length(trajectory):
-    if len(trajectory) < 2: return 0.0
-    return sum(math.sqrt((trajectory[i+1][0]-trajectory[i][0])**2 + 
-                         (trajectory[i+1][1]-trajectory[i][1])**2) 
-               for i in range(len(trajectory)-1))
 
-# ===== 1. 简化的固定向量流场 =====
-class VectorField:
-    def __init__(self, width, height):
-        self.width = width
-        self.height = height
-        self.vortices = []
-        self.uniform_flows = []
-        self._create_fixed_field() # 不再随机，使用固定场
-        
-        # 预计算网格用于绘图
-        self.grid_resolution = 40
-        self._precompute_grid()
+# ================= SumTree & PER =================
+class SumTree:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.tree = np.zeros(2 * capacity - 1)
+        self.data = np.zeros(capacity, dtype=object)
+        self.write = 0
+        self.count = 0
 
-    def _create_fixed_field(self):
-        """定义一个固定的复杂洋流场"""
-        # 一个向右上方的背景流
-        self.uniform_flows.append((0.8, 0.8))
-        
-        # 添加几个固定的涡旋 (x, y, strength, radius, direction)
-        # 阻碍直接冲向终点的大涡旋
-        self.vortices.append((500, 500, 4.0, 250, 1))   # 中央逆时针
-        self.vortices.append((200, 200, 3.0, 150, -1))  # 左下顺时针
-        self.vortices.append((800, 800, 3.0, 150, -1))  # 右上顺时针
+    def add(self, p, data):
+        idx = self.write + self.capacity - 1
+        self.data[self.write] = data
+        self.update(idx, p)
+        self.write += 1
+        if self.write >= self.capacity: self.write = 0
+        if self.count < self.capacity: self.count += 1
 
-    def get_flow_vector(self, x, y):
-        vx, vy = 0.0, 0.0
-        for ux, uy in self.uniform_flows:
-            vx += ux
-            vy += uy
-            
-        for cx, cy, strength, radius, direction in self.vortices:
-            dx, dy = x - cx, y - cy
-            dist = math.sqrt(dx*dx + dy*dy) + 1e-6
-            decay = math.exp(-(dist**2)/(2*radius**2))
-            tangent = strength * decay / dist
-            if direction > 0: # 逆时针
-                vx += -dy * tangent
-                vy += dx * tangent
+    def update(self, idx, p):
+        change = p - self.tree[idx]
+        self.tree[idx] = p
+        while idx != 0:
+            idx = (idx - 1) // 2
+            self.tree[idx] += change
+
+    def get_leaf(self, v):
+        parent = 0
+        while True:
+            left = 2 * parent + 1
+            right = left + 1
+            if left >= len(self.tree):
+                leaf = parent
+                break
+            if v <= self.tree[left]:
+                parent = left
             else:
-                vx += dy * tangent
-                vy += -dx * tangent
-        return np.array([vx, vy], dtype=np.float32)
+                v -= self.tree[left];
+                parent = right
+        d_idx = leaf - self.capacity + 1
+        return leaf, self.tree[leaf], self.data[d_idx]
 
-    def _precompute_grid(self):
-        x = np.linspace(0, self.width, self.grid_resolution)
-        y = np.linspace(0, self.height, self.grid_resolution)
-        self.grid_X, self.grid_Y = np.meshgrid(x, y)
-        self.grid_U = np.zeros_like(self.grid_X)
-        self.grid_V = np.zeros_like(self.grid_Y)
-        self.grid_M = np.zeros_like(self.grid_X)
-        for i in range(self.grid_resolution):
-            for j in range(self.grid_resolution):
-                v = self.get_flow_vector(self.grid_X[i,j], self.grid_Y[i,j])
-                self.grid_U[i,j], self.grid_V[i,j] = v[0], v[1]
-                self.grid_M[i,j] = np.linalg.norm(v)
+    @property
+    def total_p(self):
+        return self.tree[0]
 
-    def draw(self, ax):
-        ax.contourf(self.grid_X, self.grid_Y, self.grid_M, levels=15, cmap='Blues', alpha=0.3)
-        ax.quiver(self.grid_X, self.grid_Y, self.grid_U, self.grid_V, color='blue', alpha=0.5)
 
-# ===== 2. 简化的固定障碍物与地图 =====
-class CircleObstacle:
-    def __init__(self, x, y, r): self.c = np.array([x,y]); self.r = r
-    def contains(self, x, y): return np.linalg.norm(np.array([x,y])-self.c) <= self.r
-    def ray_cast(self, start, angle, max_d):
-        d = np.array([math.cos(angle), math.sin(angle)])
-        oc = start - self.c
-        a, b = np.dot(d,d), 2*np.dot(oc,d)
-        c = np.dot(oc,oc) - self.r**2
-        delta = b*b - 4*a*c
-        if delta < 0: return max_d
-        t = (-b - math.sqrt(delta))/(2*a)
-        return t if 0 < t < max_d else max_d
-    def draw(self, ax): ax.add_patch(plt.Circle(self.c, self.r, color='gray', alpha=0.7))
+class PrioritizedMemory:
+    def __init__(self, capacity):
+        self.tree = SumTree(capacity)
+        self.epsilon = 0.01
+        self.alpha = PER_ALPHA
+        self.beta = PER_BETA
+        self.beta_inc = PER_BETA_INC
+        self.n_step_buffer = collections.deque(maxlen=N_STEP)
 
+    def _get_priority(self, error):
+        return (np.abs(error) + self.epsilon) ** self.alpha
+
+    def add(self, error, sample):
+        p = self._get_priority(error)
+        self.tree.add(p, sample)
+
+    def sample(self, n):
+        batch, idxs, priorities = [], [], []
+        segment = self.tree.total_p / n
+        self.beta = np.min([1., self.beta + self.beta_inc])
+        for i in range(n):
+            a, b = segment * i, segment * (i + 1)
+            s = random.uniform(a, b)
+            (idx, p, data) = self.tree.get_leaf(s)
+            if data is 0:
+                idx = random.randint(self.tree.capacity - 1, self.tree.capacity + self.tree.count - 2)
+                data = self.tree.data[idx - self.tree.capacity + 1]
+                p = self.tree.tree[idx]
+            batch.append(data)
+            idxs.append(idx)
+            priorities.append(p)
+        probs = np.array(priorities) / self.tree.total_p
+        is_weight = np.power(self.tree.count * probs, -self.beta)
+        is_weight /= is_weight.max()
+        return batch, idxs, is_weight
+
+    def update(self, idx, error):
+        p = self._get_priority(error)
+        self.tree.update(idx, p)
+
+
+# ================= 环境类 (大幅增强版) =================
 class OceanMaze:
     def __init__(self):
-        self.width = 1000
-        self.height = 1000
-        self.vector_field = VectorField(self.width, self.height)
-        self.obstacles = [
-            CircleObstacle(300, 600, 80),
-            CircleObstacle(700, 400, 80),
-            CircleObstacle(500, 200, 60),
-            CircleObstacle(500, 800, 60),
-        ]
-        
-        # === 核心修改：固定起点和终点 ===
-        self.start_pos = list(START_POS)
-        self.destination = list(GOAL_POS)
-        self.dest_radius = 30
-        
-        self.robot = {'pos': self.start_pos.copy(), 'ori': 0, 'rad': 15}
+        self.width, self.height = 1000, 1000
+        self.vf = LambVortexField(self.width, self.height)
 
-    def reset(self):
-        """重置机器人到固定起点"""
-        self.robot['pos'] = self.start_pos.copy()
-        self.robot['ori'] = 0 # 每次都脸朝右开始
+        self.obstacles = []
+
+        # ==========================================
+        # 1. 巨型固定复合岛屿 (Fixed Mega Islands)
+        # ==========================================
+
+        # [中心巨型环礁] - 由5个大圆组成的巨型障碍
+        # 半径从原来的 40-50 增加到 70-80
+        center = np.array([500., 500.])
+        self.obstacles.append({'c': center, 'r': 80, 'drift': False})
+        self.obstacles.append({'c': center + [60, 0], 'r': 60, 'drift': False})
+        self.obstacles.append({'c': center - [60, 0], 'r': 60, 'drift': False})
+        self.obstacles.append({'c': center + [0, 60], 'r': 60, 'drift': False})
+        self.obstacles.append({'c': center - [0, 60], 'r': 60, 'drift': False})
+
+        # [左下角-连绵山脉] - 增加长度和厚度
+        start_x, start_y = 100, 200
+        for i in range(10):  # 数量增加到10个
+            self.obstacles.append({
+                'c': np.array([start_x + i * 35, start_y + i * 20], dtype=np.float64),
+                'r': 40,  # 半径从 25 增加到 40
+                'drift': False
+            })
+
+        # [顶部-宽阔峡谷壁] - 范围扩大
+        for i in range(12):  # 数量增加
+            angle = math.radians(i * 15 + 180)
+            cx = 500 + 200 * math.cos(angle)  # 弧度半径增大
+            cy = 920 + 80 * math.sin(angle)
+            self.obstacles.append({'c': np.array([cx, cy], dtype=np.float64), 'r': 35, 'drift': False})
+
+        # [角落堡垒]
+        self.obstacles.append({'c': np.array([100., 800.]), 'r': 60, 'drift': False})
+        self.obstacles.append({'c': np.array([800., 150.]), 'r': 60, 'drift': False})
+
+        # ==========================================
+        # 2. 密集漂移雷区 (Moving Minefield) - 绿色
+        # ==========================================
+
+        # [横穿地图的浮冰带] - 数量和尺寸翻倍
+        for i in range(10):
+            self.obstacles.append({
+                'c': np.array([200. + i * 60, 400. + random.uniform(-80, 80)], dtype=np.float64),
+                'r': 30,  # 半径 30 (以前是15-20)
+                'drift': True
+            })
+
+        # [右侧纵向流]
+        for i in range(8):
+            self.obstacles.append({
+                'c': np.array([800. + random.uniform(-40, 40), 300. + i * 70], dtype=np.float64),
+                'r': 30,
+                'drift': True
+            })
+
+        # [随机散布的巨型漂流物]
+        for _ in range(15):  # 随机增加 15 个大障碍
+            rx = random.uniform(100, 900)
+            ry = random.uniform(100, 900)
+            rr = random.uniform(25, 45)  # 尺寸随机大
+            self.obstacles.append({'c': np.array([rx, ry]), 'r': rr, 'drift': True})
+
+        self.start_pos = [100, 100]
+        self.goal_pos = [900, 900]
+        self.goal_radius = 30
+        self.reset()
+
+    def update_obstacles(self, dt):
+        for o in self.obstacles:
+            if o['drift']:
+                flow_vel = self.vf.get_velocity(o['c'][0], o['c'][1], self.time)
+                o['c'] += flow_vel * dt
+                # 边界检查
+                if o['c'][0] < o['r']:
+                    o['c'][0] = o['r']
+                elif o['c'][0] > self.width - o['r']:
+                    o['c'][0] = self.width - o['r']
+                if o['c'][1] < o['r']:
+                    o['c'][1] = o['r']
+                elif o['c'][1] > self.height - o['r']:
+                    o['c'][1] = self.height - o['r']
+
+    def _check_valid_pos(self, pos):
+        if not (0 < pos[0] < self.width and 0 < pos[1] < self.height):
+            return False
+        for o in self.obstacles:
+            # 障碍物变大了，这里安全距离稍微调小一点(15)，否则太难找到空位
+            if np.linalg.norm(np.array(pos) - o['c']) <= o['r'] + 15:
+                return False
+        return True
+
+    def reset(self, difficulty=1.0):
+        # 增加尝试次数，防止因地图太拥挤而卡死
+        retry_count = 0
+        while True:
+            retry_count += 1
+            self.start_pos = [random.uniform(50, self.width - 50), random.uniform(50, self.height - 50)]
+            if not self._check_valid_pos(self.start_pos): continue
+
+            min_dist = 200
+            max_dist = 300 + (1000 * difficulty)
+            angle = random.uniform(0, 2 * math.pi)
+            dist = random.uniform(min_dist, max_dist)
+
+            self.goal_pos = [
+                self.start_pos[0] + dist * math.cos(angle),
+                self.start_pos[1] + dist * math.sin(angle)
+            ]
+            if self._check_valid_pos(self.goal_pos):
+                break
+
+            # 如果尝试超过1000次没找到位置，强制缩小随机范围（极端情况保护）
+            if retry_count > 1000:
+                print("Warning: Map too crowded, retrying...")
+                retry_count = 0
+
+        self.robot = {'pos': list(self.start_pos), 'ori': random.uniform(-3.14, 3.14)}
+        self.time = 0.0
 
     def is_collision(self, x, y):
         if not (0 <= x <= self.width and 0 <= y <= self.height): return True
+        p = np.array([x, y])
         for o in self.obstacles:
-            if o.contains(x, y): return True
+            if np.linalg.norm(p - o['c']) <= o['r'] + 5: return True
         return False
-        
+
     def is_goal(self, x, y):
-        return math.hypot(x - self.destination[0], y - self.destination[1]) <= self.dest_radius
+        return math.hypot(x - self.goal_pos[0], y - self.goal_pos[1]) <= self.goal_radius
 
     def draw(self, ax):
-        self.vector_field.draw(ax)
-        for o in self.obstacles: o.draw(ax)
-        ax.add_patch(plt.Circle(self.start_pos, 15, color='green', label='Start'))
-        ax.add_patch(plt.Circle(self.destination, self.dest_radius, color='red', alpha=0.5, label='Goal'))
-        ax.set_xlim(0, self.width); ax.set_ylim(0, self.height)
+        x = np.linspace(0, self.width, 30)
+        y = np.linspace(0, self.height, 30)
+        X, Y = np.meshgrid(x, y)
+        U, V = np.zeros_like(X), np.zeros_like(Y)
+        for i in range(30):
+            for j in range(30):
+                vec = self.vf.get_velocity(X[i, j], Y[i, j], self.time)
+                U[i, j], V[i, j] = vec[0], vec[1]
+        ax.quiver(X, Y, U, V, color='blue', alpha=0.15)
 
-# ===== 3. 传感器与执行器 =====
+        for o in self.obstacles:
+            if o['drift']:
+                ax.add_patch(plt.Circle(o['c'], o['r'], color='green', alpha=0.8))
+            else:
+                ax.add_patch(plt.Circle(o['c'], o['r'], color='#444444', alpha=0.9))
+
+        ax.add_patch(plt.Circle(self.start_pos, 15, color='blue', label='Start'))
+        ax.add_patch(plt.Circle(self.goal_pos, self.goal_radius, color='red', alpha=0.5, label='Goal'))
+        ax.set_xlim(0, self.width)
+        ax.set_ylim(0, self.height)
+
+
+# ================= Sensor & Executor =================
 class Sensor:
-    def __init__(self, maze): self.maze = maze
+    def __init__(self, maze):
+        self.maze = maze
+
     def get_state(self):
-        pos, ori = self.maze.robot['pos'], self.maze.robot['ori']
+        pos = self.maze.robot['pos']
+        ori = self.maze.robot['ori']
+        t = self.maze.time
         feats = []
-        # 8个方向的雷达
         for i in range(8):
-            ang = ori + i * (2*math.pi/8)
-            d = 200 # max range
-            # 简化：只检测墙壁距离
-            for obs in self.maze.obstacles:
-                d = min(d, obs.ray_cast(np.array(pos), ang, 200))
-            feats.append(d / 200.0)
-        
-        # 目标相对信息
-        dx, dy = self.maze.destination[0]-pos[0], self.maze.destination[1]-pos[1]
-        dist = math.sqrt(dx*dx+dy*dy)
-        angle = math.atan2(dy, dx) - ori
-        angle = (angle + math.pi) % (2*math.pi) - math.pi
-        
-        # 流场信息
-        flow = self.maze.vector_field.get_flow_vector(pos[0], pos[1])
-        
-        return np.array(feats + [dist/1414.0, angle/math.pi, flow[0], flow[1]], dtype=np.float32)
+            ang = ori + i * (math.pi / 4)
+            d = 300.0
+            p = np.array(pos)
+            v = np.array([math.cos(ang), math.sin(ang)])
+            for o in self.maze.obstacles:
+                oc = p - o['c']
+                b = 2 * np.dot(v, oc)
+                c = np.dot(oc, oc) - o['r'] ** 2
+                delta = b ** 2 - 4 * c
+                if delta >= 0:
+                    dist = (-b - math.sqrt(delta)) / 2
+                    if 0 < dist < d: d = dist
+            if v[0] != 0:
+                dx = (self.maze.width - p[0]) / v[0] if v[0] > 0 else -p[0] / v[0]
+                if 0 < dx < d: d = dx
+            if v[1] != 0:
+                dy = (self.maze.height - p[1]) / v[1] if v[1] > 0 else -p[1] / v[1]
+                if 0 < dy < d: d = dy
+            feats.append(d / 300.0)
+
+        dx, dy = self.maze.goal_pos[0] - pos[0], self.maze.goal_pos[1] - pos[1]
+        dist = math.hypot(dx, dy)
+        ang_goal = math.atan2(dy, dx) - ori
+        ang_goal = (ang_goal + math.pi) % (2 * math.pi) - math.pi
+        flow = self.maze.vf.get_velocity(pos[0], pos[1], t)
+        return np.array(feats + [dist / 1414.0, ang_goal / math.pi, flow[0], flow[1]], dtype=np.float32)
+
 
 class Executor:
     def __init__(self, maze):
         self.maze = maze
-        self.dt = 1.0
-        self.vel = np.zeros(2)
+        self.propulsion_speed = PROPULSION_SPEED
+        self.dt = TIME_STEP
+        self.drag_c = DRAG_C
 
     def step(self, action):
-        # Action: 0=Keep, 1=Left, 2=Right
-        if action == 1: self.maze.robot['ori'] += 0.5
-        if action == 2: self.maze.robot['ori'] -= 0.5
-        
-        # 主动推力
-        thrust = 15.0 # 力的大小
-        ax_act = thrust * math.cos(self.maze.robot['ori'])
-        ay_act = thrust * math.sin(self.maze.robot['ori'])
-        
-        # 动力学积分
-        pos_np = np.array(self.maze.robot['pos'])
-        
-        def acc_func(p, t):
-            f = self.maze.vector_field.get_flow_vector(p[0], p[1])
-            return np.array([ax_act + f[0], ay_act + f[1]]) # 推力 + 洋流
-            
-        new_pos, new_vel = integrate_step(acc_func, pos_np, self.vel, 0, self.dt)
-        self.vel = new_vel
+        self.maze.update_obstacles(self.dt)
+
+        d_theta = 0.0
+        if action == 1: d_theta = 0.2
+        if action == 2: d_theta = -0.2
+        self.maze.robot['ori'] += d_theta
+
+        current_ori = self.maze.robot['ori']
+        pos = np.array(self.maze.robot['pos'])
+        t = self.maze.time
+
+        va_vec = np.array([
+            self.propulsion_speed * math.cos(current_ori),
+            self.propulsion_speed * math.sin(current_ori)
+        ])
+        vo_vec = self.maze.vf.get_velocity(pos[0], pos[1], t)
+        new_pos, vs_vec = kinematic_update(pos, va_vec, vo_vec, self.dt)
+
         self.maze.robot['pos'] = list(new_pos)
-        
-        # 奖励计算
+        self.maze.time += self.dt
+
+        step_energy = self.drag_c * (self.propulsion_speed ** 3) * self.dt
+
+        goal = np.array(self.maze.goal_pos)
+        d_old = np.linalg.norm(pos - goal)
+        d_new = np.linalg.norm(new_pos - goal)
+
         reward = -TIME_PENALTY
-        d_old = math.hypot(pos_np[0]-self.maze.destination[0], pos_np[1]-self.maze.destination[1])
-        d_new = math.hypot(new_pos[0]-self.maze.destination[0], new_pos[1]-self.maze.destination[1])
         reward += (d_old - d_new) * PROGRESS_WEIGHT
-        
-        # 能量消耗 (逆流惩罚)
-        flow = self.maze.vector_field.get_flow_vector(pos_np[0], pos_np[1])
-        dot = ax_act*flow[0] + ay_act*flow[1]
-        if dot < 0: reward -= ENERGY_WEIGHT * abs(dot) # 逆流更费电
-        
+
+        vec_to_goal = goal - new_pos
+        norm_goal = np.linalg.norm(vec_to_goal)
+        vs_norm = np.linalg.norm(vs_vec)
+
+        if norm_goal > 1e-3 and vs_norm > 1e-3:
+            cosine = np.dot(vs_vec, vec_to_goal) / (vs_norm * norm_goal)
+            reward += DIR_WEIGHT * cosine
+
         done = False
         if self.maze.is_collision(new_pos[0], new_pos[1]):
             reward += COLLISION_REWARD
-            # 撞墙稍微弹回来一点，防止卡死，但不结束
-            self.maze.robot['pos'] = list(pos_np) 
-            self.vel = np.zeros(2)
-        
+            self.maze.robot['pos'] = list(pos)
+
         if self.maze.is_goal(new_pos[0], new_pos[1]):
             reward += GOAL_REWARD
             done = True
-            
-        return reward, done
 
-# ===== 4. DQN Agent =====
-class DQN(nn.Module):
+        return reward, done, step_energy
+
+
+# ================= 智能体定义 =================
+class Net(nn.Module):
     def __init__(self, s_dim, a_dim):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(s_dim, 256), nn.ReLU(),
-            nn.Linear(256, 256), nn.ReLU(),
-            nn.Linear(256, a_dim)
+        self.fc = nn.Sequential(
+            nn.Linear(s_dim, 512), nn.ReLU(),
+            nn.Linear(512, 256), nn.ReLU(),
+            nn.Linear(256, 128), nn.ReLU(),
+            nn.Linear(128, a_dim)
         )
-    def forward(self, x): return self.net(x)
+
+    def forward(self, x): return self.fc(x)
+
 
 class Agent:
-    def __init__(self, state_dim, action_dim):
-        self.eval_net = DQN(state_dim, action_dim).to(DEVICE)
-        self.target_net = DQN(state_dim, action_dim).to(DEVICE)
+    def __init__(self, s_dim, a_dim):
+        self.eval_net = Net(s_dim, a_dim).to(DEVICE)
+        self.target_net = Net(s_dim, a_dim).to(DEVICE)
         self.target_net.load_state_dict(self.eval_net.state_dict())
-        self.opt = torch.optim.Adam(self.eval_net.parameters(), lr=3e-4)
-        self.mem = collections.deque(maxlen=20000)
-        self.batch = 128
-        self.eps = 1.0 if IS_TRAINING else 0.05
+        self.opt = optim.Adam(self.eval_net.parameters(), lr=LR)
+        self.memory = PrioritizedMemory(MEMORY_CAPACITY)
         self.steps = 0
+        self.eps = 1.0 if IS_TRAINING else 0.05
 
     def act(self, s):
         if random.random() < self.eps: return random.randint(0, 2)
-        state = torch.FloatTensor(s).unsqueeze(0).to(DEVICE)
-        return self.eval_net(state).argmax().item()
+        s_t = torch.FloatTensor(s).unsqueeze(0).to(DEVICE)
+        with torch.no_grad(): return self.eval_net(s_t).argmax().item()
+
+    def store_transition(self, s, a, r, ns, done):
+        transition = (s, a, r, ns, done)
+        self.memory.n_step_buffer.append(transition)
+        if len(self.memory.n_step_buffer) < N_STEP and not done: return
+        R, gamma = 0, 1
+        for (_, _, r_i, _, _) in self.memory.n_step_buffer:
+            R += r_i * gamma;
+            gamma *= GAMMA
+        s0, a0 = self.memory.n_step_buffer[0][:2]
+        nsn, donen = self.memory.n_step_buffer[-1][3:]
+        max_p = np.max(self.memory.tree.tree[-self.memory.tree.capacity:])
+        if max_p == 0: max_p = ABS_ERROR_UPPER
+        self.memory.add(max_p, (s0, a0, R, nsn, donen))
+        if done: self.memory.n_step_buffer.clear()
 
     def learn(self):
-        if len(self.mem) < self.batch: return
-        batch = random.sample(self.mem, self.batch)
+        if self.memory.tree.count < BATCH_SIZE: return
+        batch, idxs, is_weights = self.memory.sample(BATCH_SIZE)
         s, a, r, ns, d = zip(*batch)
-        
         s_t = torch.FloatTensor(np.array(s)).to(DEVICE)
         a_t = torch.LongTensor(a).unsqueeze(1).to(DEVICE)
         r_t = torch.FloatTensor(r).unsqueeze(1).to(DEVICE)
         ns_t = torch.FloatTensor(np.array(ns)).to(DEVICE)
         d_t = torch.FloatTensor(d).unsqueeze(1).to(DEVICE)
-
-        q_curr = self.eval_net(s_t).gather(1, a_t)
-        q_next = self.target_net(ns_t).max(1)[0].unsqueeze(1)
-        q_targ = r_t + 0.99 * q_next * (1 - d_t)
-        
-        loss = nn.MSELoss()(q_curr, q_targ)
-        self.opt.zero_grad(); loss.backward(); self.opt.step()
-        
+        w_t = torch.FloatTensor(is_weights).unsqueeze(1).to(DEVICE)
+        q_eval = self.eval_net(s_t).gather(1, a_t)
+        with torch.no_grad():
+            a_next = self.eval_net(ns_t).argmax(dim=1, keepdim=True)
+            q_next = self.target_net(ns_t).gather(1, a_next)
+            q_target = r_t + (GAMMA ** N_STEP) * q_next * (1 - d_t)
+        td_errors = (q_target - q_eval).detach().cpu().numpy().flatten()
+        loss = (w_t * (q_target - q_eval).pow(2)).mean()
+        self.opt.zero_grad();
+        loss.backward();
+        self.opt.step()
+        for i in range(BATCH_SIZE): self.memory.update(idxs[i], td_errors[i])
         self.steps += 1
         if self.steps % 200 == 0: self.target_net.load_state_dict(self.eval_net.state_dict())
-        if self.eps > 0.05: self.eps *= 0.9999
+        if self.eps > 0.05: self.eps *= 0.99995
 
     def save(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(self.eval_net.state_dict(), path)
         Prog.log("BEST", f"Model saved to {path}")
 
@@ -312,74 +487,156 @@ class Agent:
         if os.path.exists(path):
             self.eval_net.load_state_dict(torch.load(path, map_location=DEVICE))
             self.target_net.load_state_dict(self.eval_net.state_dict())
-            Prog.log("INIT", f"Loaded model from {path}")
+            Prog.log("TEST", f"Model loaded: {path}")
         else:
-            Prog.log("WARN", "Model file not found!")
+            Prog.log("WARN", "Model not found")
 
-# ===== 主程序逻辑 =====
+
+def calc_len(traj):
+    if len(traj) < 2: return 0
+    return sum(math.hypot(traj[i + 1][0] - traj[i][0], traj[i + 1][1] - traj[i][1]) for i in range(len(traj) - 1))
+
+
+def save_plot(maze, traj, filename, title_text=None):
+    """保存静态图片 (训练时用)"""
+    fig, ax = plt.subplots(figsize=(10, 10))
+    maze.draw(ax)
+    t_np = np.array(traj)
+    ax.plot(t_np[:, 0], t_np[:, 1], 'r-', lw=2, label="Trajectory")
+    ax.legend()
+    ax.set_title(title_text if title_text else "Trajectory")
+    plt.savefig(filename)
+    plt.close(fig)
+
+
+def save_gif(maze, robot_hist, obs_hist, filename, title_text=None):
+    """生成动态GIF (测试时用)"""
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # 抽样帧数
+    skip = 2
+    frames = range(0, len(robot_hist), skip)
+
+    def update(frame_idx):
+        ax.clear()
+        maze.robot['pos'] = list(robot_hist[frame_idx])
+
+        current_obs_data = obs_hist[frame_idx]
+        for i, o in enumerate(maze.obstacles):
+            o['c'] = current_obs_data[i]
+
+        maze.draw(ax)
+
+        hist_np = np.array(robot_hist[:frame_idx + 1])
+        if len(hist_np) > 1:
+            ax.plot(hist_np[:, 0], hist_np[:, 1], 'r-', lw=2, label="Trajectory")
+
+        ax.set_title(f"{title_text} | Step {frame_idx}")
+
+    print(f"Generating GIF: {filename} ...")
+    ani = FuncAnimation(fig, update, frames=frames, interval=100)
+    ani.save(filename, writer='pillow', fps=15)
+    plt.close(fig)
+
+
 if __name__ == "__main__":
     maze = OceanMaze()
     sensor = Sensor(maze)
     executor = Executor(maze)
-    agent = Agent(12, 3) # State dim ~ 12, Action dim = 3
+    agent = Agent(s_dim=12, a_dim=3)
 
     if IS_TRAINING:
-        Prog.log("INIT", f"START TRAINING (Fixed Task: {START_POS} -> {GOAL_POS})")
-        episodes = 1500
-        best_len = float('inf')
-        
-        for ep in range(episodes):
-            maze.reset()
-            executor.vel = np.zeros(2) # 重置速度
+        Prog.log("INIT", "START TRAINING (Curriculum: Easy -> Hard)")
+        best_score = float('inf')
+        for ep in range(EPISODES):
+            if ep < 800:
+                difficulty = 0.2 + (0.3 * ep / 800)
+            elif ep < 1500:
+                difficulty = 0.5 + (0.3 * (ep - 800) / 700)
+            else:
+                difficulty = 1.0
+
+            maze.reset(difficulty=difficulty)
             traj = [tuple(maze.robot['pos'])]
             ep_reward = 0
-            
-            for t in range(600): # Max steps
+            ep_energy = 0
+
+            for t in range(MAX_STEPS):
                 s = sensor.get_state()
                 a = agent.act(s)
-                r, done = executor.step(a)
+                r, done, eng = executor.step(a)
                 ns = sensor.get_state()
-                agent.mem.append((s, a, r, ns, done))
+                agent.store_transition(s, a, r, ns, done)
                 agent.learn()
-                
+
                 ep_reward += r
+                ep_energy += eng
                 traj.append(tuple(maze.robot['pos']))
-                
+
                 if done:
-                    plen = calculate_path_length(traj)
-                    Prog.log("LEARN", f"Ep {ep} | Reward {ep_reward:.1f} | Len {plen:.1f}")
-                    if plen < best_len:
-                        best_len = plen
-                        agent.save(MODEL_PATH) # 只有破纪录才保存
+                    plen = calc_len(traj)
+                    score = plen + LAMBDA_SCORE * ep_energy
+                    Prog.log("LEARN", f"Ep {ep} (Diff {difficulty:.1f}) | Len:{plen:.0f} | Score:{score:.1f}")
+                    if difficulty > 0.5 and score < best_score:
+                        best_score = score
+                        agent.save(MODEL_PATH)
+                        title = f"Ep {ep} Best Score: {best_score:.1f} (Diff {difficulty:.1f})"
+                        save_plot(maze, traj, f"train_best_ep{ep}.png", title)
+                        Prog.log("BEST", "New Record!")
                     break
-            
-            # 没到终点也可以衰减一下epsilon
-            if ep % 10 == 0: 
+
+            if ep % 20 == 0:
                 Prog.log("LEARN", f"Ep {ep} running... Eps: {agent.eps:.3f}")
 
+        final_path = os.path.join("checkpoints", "ddqn_final_state.pth")
+        agent.save(final_path)
+        Prog.log("INIT", f"Training Finished! Final model saved to {final_path}")
+
     else:
-        # === 测试模式 ===
-        Prog.log("INIT", "START TESTING PHASE")
+        # === 测试模式：只保存成功的GIF ===
+        Prog.log("TEST", "START TESTING PHASE (Saving Successes Only)")
         agent.load(MODEL_PATH)
-        maze.reset()
-        executor.vel = np.zeros(2)
-        traj = [tuple(maze.robot['pos'])]
-        
-        done = False
-        steps = 0
-        while not done and steps < 1000:
-            s = sensor.get_state()
-            a = agent.act(s) # 此时 eps 很小，基本是贪心策略
-            r, done = executor.step(a)
-            traj.append(tuple(maze.robot['pos']))
-            steps += 1
-            if steps % 50 == 0: print(f"Step {steps}...")
-        
-        # 绘图
-        fig, ax = plt.subplots(figsize=(10,10))
-        maze.draw(ax)
-        t_np = np.array(traj)
-        ax.plot(t_np[:,0], t_np[:,1], 'r-', linewidth=2, label='Trajectory')
-        ax.set_title(f"Test Run: {len(traj)} steps")
-        plt.legend()
-        plt.show()
+
+        save_dir = "test_results_gif"
+        os.makedirs(save_dir, exist_ok=True)
+        print(f"GIFs will be saved to: {os.path.abspath(save_dir)}")
+
+        success_count = 0
+
+        # 增加循环次数到10次，防止成功率低时生成不了文件
+        for i in range(10):
+            maze.reset(difficulty=1.0)
+
+            traj = [tuple(maze.robot['pos'])]
+            obs_log = [[o['c'].copy() for o in maze.obstacles]]
+
+            ep_eng = 0
+            done = False
+
+            for step_i in range(MAX_STEPS):
+                s = sensor.get_state()
+                a = agent.act(s)
+                _, done, eng = executor.step(a)
+                ep_eng += eng
+
+                traj.append(tuple(maze.robot['pos']))
+                obs_log.append([o['c'].copy() for o in maze.obstacles])
+
+                if done:
+                    success_count += 1
+                    print(f"Test {i + 1:02d}: Success! Len {calc_len(traj):.0f}")
+                    break
+            else:
+                print(f"Test {i + 1:02d}: Failed.")
+
+            # === 修改处：只在 done (成功) 时生成 GIF ===
+            if done:
+                title = f"Test {i + 1} | Success"
+                file_name = f"test_{i + 1:02d}_success.gif"
+                full_path = os.path.join(save_dir, file_name)
+                save_gif(maze, traj, obs_log, full_path, title)
+            else:
+                print(f"Test {i + 1:02d}: Fail (Skipping GIF save)")
+
+        print("-" * 30)
+        print(f"Final Success Rate: {success_count / 10 * 100:.1f}%")
