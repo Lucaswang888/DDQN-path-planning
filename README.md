@@ -1,19 +1,6 @@
 :blush:
 动态洋流场景下的深度强化学习（Deep Reinforcement Learning, DRL） 的自主导航系统 🌊:
 
-基础网络：DDQN
-优化策略：
-优先经验回放 (PER, Prioritized Experience Replay)
-多步学习 N-Step Learning
-
-研究问题：
-我们假设 ASV 的推进速度是恒定的。
-顺洋流，速度快，用时短，耗能少
-逆洋流，速度慢，用时长，耗能多
-
-环境感知
-
-这是一个格式完整的 `README.md` 文件内容。您可以直接点击代码框右上角的“复制”按钮，然后将其粘贴并保存为名为 `README.md` 的文件中。
 
 
 # OceanMaze: 基于 DDQN 的复杂流场动态路径规划
@@ -131,9 +118,3 @@ python main.py
 | `MEMORY_CAPACITY` | 50000 | PER 经验池容量 |
 | `EPISODES` | 3000 | 总训练轮数 |
 
-## 🤝 致谢
-
-本项目参考了 ASV 路径规划领域的相关文献，特别是关于能量感知（Energy-Aware）导航和流场利用的研究。代码实现了一个完整的“论文复现级”仿真环境。
-
-```
-```
