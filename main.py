@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # main.py
-# 论文复现版 (支持 argparse + 函数封装)
+# 论文复现版 (Standardized Style with Argparse)
 
 import os
 import sys
@@ -560,7 +560,7 @@ if __name__ == '__main__':
     # 1. Path & Mode
     parser.add_argument('--phase', type=str, default='train', choices=['train', 'test'], help='Phase: train or test.')
     parser.add_argument('--output_dir', type=str, default='checkpoints', help='Directory to save checkpoints.')
-    parser.add_argument('--model_name', type=str, default='ddqn_final_state.pth', help='Model filename to load/save.')
+    parser.add_argument('--model_name', type=str, default='ddqn_best.pth', help='Model filename to load/save.')
     parser.add_argument('--result_dir', type=str, default='test_results_gif', help='Directory for test results.')
     parser.add_argument('--resume', action='store_true', help='Resume training from checkpoint.')
 
@@ -575,7 +575,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size.')
     parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor.')
     parser.add_argument('--base_lr', type=float, default=1e-4, help='Learning rate.')
-    parser.add_argument('--max_steps', type=int, default=500, help='Max steps per episode.')  # 训练用小一点，测试时可大
+    parser.add_argument('--max_steps', type=int, default=1000, help='Max steps per episode.')  # 训练用小一点，测试时可大
     parser.add_argument('--episodes', type=int, default=3000, help='Total training episodes.')
     parser.add_argument('--n_step', type=int, default=3, help='N-step return.')
 
